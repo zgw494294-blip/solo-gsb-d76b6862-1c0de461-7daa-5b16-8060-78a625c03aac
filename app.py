@@ -30,8 +30,13 @@ Guarantees:
   terminate that arrives while Popen is still in flight is remembered and
   the starter kills the freshly created child itself, so an unfinished
   start can never leave a process behind.
-* a new run is not admitted while a previous child is still alive or being
-  reaped; the starter waits for reaping (briefly) rather than racing it.
+* a new run is registered only when there is no current run or the current
+  run's child has been fully reaped.  Starters parked waiting for a previous
+  child to be reaped re-check admission against whatever run is current when
+  they wake (a replacement run may itself already be terminal but unreaped),
+  so a successor is never registered or spawned while a previous child is
+  still alive or being reaped; a wait timeout is a 409 that leaves the
+  current run untouched.
 * late events (a pause already buffered in the pipe when the child was
   killed) are discarded once the run is terminal or no longer current, so
   they can never flip terminated/finished back to an active state.
@@ -42,6 +47,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import uuid
 
 from flask import Flask, jsonify, render_template, request
@@ -199,20 +205,29 @@ def api_run():
         return jsonify({"error": f"代码最多 {MAX_LINES} 行（当前 {line_count} 行）"}), 400
 
     with COND:
-        # An active run (including one still starting up) conflicts. A
-        # terminal run whose child is not reaped yet must finish reaping
-        # before the next run is admitted, so the old process can neither
-        # survive alongside the new one nor be reaped while it is current.
-        old = CURRENT
-        if old is not None and old.status in ACTIVE_STATES:
-            return jsonify({"error": "已有未结束的运行，请先终止或等待其结束"}), 409
-        if old is not None and not old.reaped:
-            if not _wait_reaped(old):
-                return jsonify({"error": "上一个运行的子进程尚未回收，请稍后重试"}), 409
-            # While we waited another starter may have won the slot
-            # (CURRENT never returns to None after the first run).
-            if CURRENT is not old and CURRENT.status in ACTIVE_STATES:
+        # Admission is decided against the run that is current *right now*
+        # and re-decided on every wake-up: while we park waiting for a
+        # previous child to be reaped, another starter may win the slot, and
+        # that replacement run may itself already be terminal (but still
+        # unreaped) by the time we look again.  The next run is registered
+        # only when there is no current run or the current run's child has
+        # been fully reaped, so a successor is never registered (let alone
+        # spawned) while a previous child is still alive or being reaped,
+        # and a run_id is never invalidated before its run was reaped.
+        deadline = time.monotonic() + REAP_WAIT_TIMEOUT
+        while True:
+            old = CURRENT
+            if old is not None and old.status in ACTIVE_STATES:
+                # An active run (including one still starting up) conflicts.
                 return jsonify({"error": "已有未结束的运行，请先终止或等待其结束"}), 409
+            if old is None or old.reaped:
+                break
+            # Terminal but not reaped yet: wait for the reaper, then loop
+            # and re-check against whatever CURRENT is when we wake.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not _wait_reaped(old, timeout=remaining):
+                # Timeout: report 409 without replacing the current run.
+                return jsonify({"error": "上一个运行的子进程尚未回收，请稍后重试"}), 409
 
         run = Run(code)
         CURRENT = run

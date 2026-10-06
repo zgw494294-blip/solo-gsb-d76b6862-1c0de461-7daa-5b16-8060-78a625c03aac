@@ -11,9 +11,15 @@ Covers:
   * late events after termination can never flip a terminal run back to an
     active state (white-box event application + end-to-end event flood);
   * normal pause/step/continue flow and duplicate/stale 409 rules;
-  * terminating a runaway infinite loop after continue.
+  * terminating a runaway infinite loop after continue;
+  * multiple starters parked on an un-reaped terminal run: admission after
+    wake-up is re-decided against the then-current run, so a replacement
+    run that is itself terminal-but-unreaped is never leapfrogged, an
+    active replacement makes the other waiters fail with 409, and a reaping
+    timeout is a 409 that leaves the current run untouched.
 """
 
+import contextlib
 import json
 import os
 import threading
@@ -474,6 +480,246 @@ class RaceTests(unittest.TestCase):
         new_id = self.start_run()
         self.wait_paused(new_id)
         self.cleanup_run(new_id)
+
+    # ---- 9. multiple waiters parked on an un-reaped terminal run ---------
+
+    @contextlib.contextmanager
+    def gated_popen(self, max_gated, before_spawn=None):
+        """Real Popen, but the first ``max_gated`` children get a wait()
+        that parks on a test-released gate: the child exits on its own yet
+        stays un-reaped (zombie) until the test releases the gate.  This
+        reproduces "run reported ended, exit cleanup not done yet" with a
+        real process and a fully controlled interleaving.  Yields the list
+        of per-child release events, in creation order."""
+        real_popen = self._real_popen
+        gates = []
+
+        class GatedProc:
+            def __init__(self, proc):
+                self._proc = proc
+                self.gate = threading.Event()
+                gates.append(self.gate)
+
+            def wait(self, timeout=None):
+                self.gate.wait(10)  # bounded park; tests release the gate
+                return self._proc.wait(timeout=timeout)
+
+            def __getattr__(self, name):
+                return getattr(self._proc, name)
+
+        def wrapping_popen(*args, **kwargs):
+            if before_spawn is not None:
+                before_spawn()
+            proc = real_popen(*args, **kwargs)
+            self.created.append(proc)
+            if len(gates) < max_gated:
+                return GatedProc(proc)
+            return proc
+
+        with mock.patch.object(appmod.subprocess, "Popen", wrapping_popen):
+            yield gates
+        for gate in gates:
+            gate.set()  # never leave a reader thread parked after the test
+
+    def terminal_unreaped_run(self, code=SIMPLE_CODE):
+        """Start a real run and drive it to natural end while its reaping is
+        parked on a gate: terminal status, child exited, not yet reaped.
+        Returns (run_id, Run)."""
+        run_id = self.start_run(code)
+        self.wait_paused(run_id)
+        seq = self.state()["pause_seq"]
+        res = self.client.post("/api/continue",
+                               json={"run_id": run_id, "pause_seq": seq})
+        self.assertEqual(res.status_code, 200)
+        with appmod.COND:
+            run = appmod.CURRENT
+        ok = wait_for(lambda: run.status == "finished" and not run.reaped
+                      and run.proc.poll() is not None)
+        self.assertTrue(ok, "run never reached terminal-but-unreaped state")
+        return run_id, run
+
+    def test_woken_waiter_rechecked_against_current_run(self):
+        """Two starters wait for an un-reaped terminal run; after the old
+        child is reaped, the first admitted run reports ended but its exit
+        cleanup is still pending.  The second waiter must not register or
+        spawn the next run until that replacement run is reaped too."""
+        admitted = []  # runs that were CURRENT at each spawn, in order
+        spawn_errors = []
+
+        def note_spawn():
+            with appmod.COND:
+                for prev in admitted:
+                    if not prev.reaped:
+                        spawn_errors.append(
+                            f"new child spawned while run {prev.run_id} unreaped")
+                admitted.append(appmod.CURRENT)
+
+        with self.gated_popen(max_gated=2, before_spawn=note_spawn) as gates:
+            old_id, old_run = self.terminal_unreaped_run()
+            self.assertEqual(len(gates), 1)
+
+            # Two starters park on the old run's reaping at the same time.
+            real_wait = appmod._wait_reaped
+            waits = []  # (thread, run) each starter is parked on
+            both_parked = threading.Event()
+            b_may_recheck = threading.Event()
+            threads = {}
+
+            def recording_wait(run, timeout=None):
+                me = threading.current_thread()
+                waits.append((me, run))
+                if len({t for t, _ in waits}) == 2:
+                    both_parked.set()
+                ok = real_wait(run, timeout=timeout if timeout is not None
+                               else appmod.REAP_WAIT_TIMEOUT)
+                if me is threads["b"] and run is old_run:
+                    # Hold B's re-check (without holding COND) until the
+                    # replacement run is terminal-but-unreaped, so the
+                    # wake-up interleaving is deterministic.
+                    appmod.COND.release()
+                    self.assertTrue(b_may_recheck.wait(timeout=10))
+                    appmod.COND.acquire()
+                return ok
+
+            results = {}
+
+            def starter(name, code):
+                res = self.client.post("/api/run", json={"code": code})
+                results[name] = (res.status_code, res.get_json())
+
+            with mock.patch.object(appmod, "_wait_reaped", recording_wait):
+                threads["a"] = threading.Thread(target=starter,
+                                                args=("a", "a = 1\n"))
+                threads["b"] = threading.Thread(target=starter,
+                                                args=("b", "b = 2\n"))
+                threads["a"].start()
+                threads["b"].start()
+                self.assertTrue(both_parked.wait(10), "starters never parked")
+
+                # Old child reaped: A is admitted, B stays held for now.
+                gates[0].set()
+                self.assertTrue(wait_for(lambda: "a" in results))
+                self.assertEqual(results["a"][0], 200, results)
+                run_a_id = results["a"][1]["run_id"]
+                self.assertNotEqual(run_a_id, old_id)
+
+                # The replacement run now reports ended, but its child is
+                # exited-yet-unreaped (cleanup still pending).
+                self.wait_paused(run_a_id)
+                seq = self.state()["pause_seq"]
+                res = self.client.post("/api/continue",
+                                       json={"run_id": run_a_id,
+                                             "pause_seq": seq})
+                self.assertEqual(res.status_code, 200)
+                with appmod.COND:
+                    run_a = appmod.CURRENT
+                self.assertTrue(wait_for(
+                    lambda: run_a.status == "finished" and not run_a.reaped
+                    and self.created[1].poll() is not None),
+                    "replacement run never reached terminal-but-unreaped")
+                self.assertEqual(len(gates), 2)
+
+                # B wakes from the old run's reaping now.  It must wait for
+                # the replacement run's reaping instead of leapfrogging it.
+                b_may_recheck.set()
+                self.assertTrue(wait_for(
+                    lambda: any(t is threads["b"] and r is run_a
+                                for t, r in waits), timeout=5),
+                    "woken starter did not wait for the replacement's reaping")
+                self.assertNotIn("b", results)  # still parked, not admitted
+                # The previous identity stays valid until its run is reaped.
+                self.assertEqual(self.state()["run_id"], run_a_id)
+
+                gates[1].set()  # replacement reaped: B may be admitted now
+                threads["b"].join(timeout=10)
+                threads["a"].join(timeout=10)
+                self.assertFalse(threads["b"].is_alive())
+
+            self.assertEqual(results["b"][0], 200, results)
+            run_b_id = results["b"][1]["run_id"]
+            self.assertNotEqual(run_b_id, run_a_id)
+            self.assertEqual(spawn_errors, [])
+            self.assertEqual(len(self.created), 3)
+            with appmod.COND:
+                self.assertTrue(old_run.reaped)
+                self.assertTrue(run_a.reaped)
+                self.assertEqual(appmod.CURRENT.run_id, run_b_id)
+            self.assertEqual(self.state()["run_id"], run_b_id)
+            self.wait_paused(run_b_id)
+            self.cleanup_run(run_b_id)
+
+    def test_woken_waiter_conflicts_with_active_replacement(self):
+        """Two starters wait for an un-reaped terminal run; once the old
+        child is reaped exactly one is admitted, and the other sees the
+        active replacement holding the slot and gets 409 (no new process)."""
+        with self.gated_popen(max_gated=1) as gates:
+            old_id, old_run = self.terminal_unreaped_run()
+
+            real_wait = appmod._wait_reaped
+            parked = []
+            both_parked = threading.Event()
+
+            def recording_wait(run, timeout=None):
+                parked.append(threading.current_thread())
+                if len(set(parked)) == 2:
+                    both_parked.set()
+                return real_wait(run, timeout=timeout if timeout is not None
+                                 else appmod.REAP_WAIT_TIMEOUT)
+
+            results = {}
+
+            def starter(name):
+                res = self.client.post("/api/run", json={"code": SIMPLE_CODE})
+                results[name] = (res.status_code, res.get_json())
+
+            with mock.patch.object(appmod, "_wait_reaped", recording_wait):
+                threads = [threading.Thread(target=starter, args=(n,))
+                           for n in ("a", "b")]
+                for t in threads:
+                    t.start()
+                self.assertTrue(both_parked.wait(10), "starters never parked")
+                gates[0].set()  # old child reaped: exactly one may proceed
+                for t in threads:
+                    t.join(timeout=10)
+                    self.assertFalse(t.is_alive())
+
+            codes = sorted(r[0] for r in results.values())
+            self.assertEqual(codes, [200, 409], results)
+            self.assertEqual(len(self.created), 2,
+                             "conflicting waiter spawned a process")
+            winner = next(r for r in results.values() if r[0] == 200)
+            winner_id = winner[1]["run_id"]
+            self.assertNotEqual(winner_id, old_id)
+            self.assertEqual(self.state()["run_id"], winner_id)
+            self.wait_paused(winner_id)
+            self.cleanup_run(winner_id)
+
+    def test_wait_for_reap_timeout_keeps_current_run(self):
+        """A starter waiting for the previous child to be reaped times out
+        with 409 and must not replace the current run early; once reaping
+        completes, the re-run is admitted."""
+        with self.gated_popen(max_gated=1) as gates:
+            old_id, old_run = self.terminal_unreaped_run()
+            with mock.patch.object(appmod, "REAP_WAIT_TIMEOUT", 0.3):
+                started = time.monotonic()
+                res = self.client.post("/api/run", json={"code": SIMPLE_CODE})
+                elapsed = time.monotonic() - started
+            self.assertEqual(res.status_code, 409)
+            self.assertGreaterEqual(elapsed, 0.2,
+                                    "409 returned without actually waiting")
+            self.assertLess(elapsed, 5)
+            # The timed-out request changed nothing: same current run, still
+            # un-reaped, and no new child was spawned.
+            self.assertEqual(self.state()["run_id"], old_id)
+            self.assertFalse(old_run.reaped)
+            self.assertEqual(len(self.created), 1)
+
+            gates[0].set()  # reaping completes -> re-run is admitted
+            self.assertTrue(wait_for(lambda: old_run.reaped))
+            new_id = self.start_run()
+            self.assertNotEqual(new_id, old_id)
+            self.wait_paused(new_id)
+            self.cleanup_run(new_id)
 
 
 if __name__ == "__main__":
