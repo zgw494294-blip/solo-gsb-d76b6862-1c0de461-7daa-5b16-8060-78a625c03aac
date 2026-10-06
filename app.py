@@ -32,6 +32,12 @@ Guarantees:
   start can never leave a process behind.
 * a new run is not admitted while a previous child is still alive or being
   reaped; the starter waits for reaping (briefly) rather than racing it.
+  A starter that parked on an unreaped predecessor re-evaluates the run
+  that is current *at wake-up time*: an active replacement conflicts
+  (409), a terminal-but-unreaped replacement is waited on in turn, and
+  only a reaped predecessor frees the slot. Waiting never replaces
+  CURRENT and never registers or spawns the next run early; it times out
+  with 409.
 * late events (a pause already buffered in the pipe when the child was
   killed) are discarded once the run is terminal or no longer current, so
   they can never flip terminated/finished back to an active state.
@@ -42,6 +48,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import uuid
 
 from flask import Flask, jsonify, render_template, request
@@ -203,16 +210,24 @@ def api_run():
         # terminal run whose child is not reaped yet must finish reaping
         # before the next run is admitted, so the old process can neither
         # survive alongside the new one nor be reaped while it is current.
-        old = CURRENT
-        if old is not None and old.status in ACTIVE_STATES:
-            return jsonify({"error": "已有未结束的运行，请先终止或等待其结束"}), 409
-        if old is not None and not old.reaped:
-            if not _wait_reaped(old):
-                return jsonify({"error": "上一个运行的子进程尚未回收，请稍后重试"}), 409
-            # While we waited another starter may have won the slot
-            # (CURRENT never returns to None after the first run).
-            if CURRENT is not old and CURRENT.status in ACTIVE_STATES:
+        # The admission decision is re-evaluated against the run that is
+        # current *at wake-up time* after every wait: if another starter
+        # won the slot while we parked, its run owns the slot until it is
+        # terminal AND reaped; only then may the next run be registered.
+        # Waiting never replaces CURRENT, never spawns a process, and
+        # times out with 409.
+        deadline = time.monotonic() + REAP_WAIT_TIMEOUT
+        while True:
+            old = CURRENT
+            if old is None:
+                break  # no run yet: the slot is free
+            if old.status in ACTIVE_STATES:
                 return jsonify({"error": "已有未结束的运行，请先终止或等待其结束"}), 409
+            if old.reaped:
+                break  # previous run terminal and reaped: the slot is free
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not _wait_reaped(old, timeout=remaining):
+                return jsonify({"error": "上一个运行的子进程尚未回收，请稍后重试"}), 409
 
         run = Run(code)
         CURRENT = run

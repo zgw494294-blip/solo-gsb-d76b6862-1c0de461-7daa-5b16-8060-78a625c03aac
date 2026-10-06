@@ -11,7 +11,11 @@ Covers:
   * late events after termination can never flip a terminal run back to an
     active state (white-box event application + end-to-end event flood);
   * normal pause/step/continue flow and duplicate/stale 409 rules;
-  * terminating a runaway infinite loop after continue.
+  * terminating a runaway infinite loop after continue;
+  * multiple rerun requests parked on an unreaped predecessor: a woken
+    waiter must re-check the run current at that moment and must not
+    register/spawn a run while the replacement that won the slot is
+    terminal but not yet reaped.
 """
 
 import json
@@ -474,6 +478,176 @@ class RaceTests(unittest.TestCase):
         new_id = self.start_run()
         self.wait_paused(new_id)
         self.cleanup_run(new_id)
+
+    # ---- 9. multiple rerun waiters racing for the freed slot ------------
+
+    def test_waiters_cannot_overtake_unreaped_replacement(self):
+        """Two rerun requests park on an old run that ended but is not
+        reaped yet. Once the old child is reaped, the slot is taken by a
+        replacement run that has already reported a terminal state while
+        its exit cleanup (reaping) is still incomplete: the parked waiters
+        must re-park on the replacement instead of registering/spawning a
+        new run (which would leave two live children and invalidate the
+        replacement's run_id). Only after the replacement is reaped may
+        exactly one waiter be admitted; the other gets 409."""
+        # A real run plays the replacement: its child is alive and paused.
+        # Pinning its status to a terminal state reproduces the window
+        # where the end/exception event already landed but the reader
+        # thread has not reaped the child yet.
+        replacement_id = self.start_run()
+        self.wait_paused(replacement_id)
+        with appmod.COND:
+            replacement = appmod.CURRENT
+            replacement_proc = replacement.proc
+            replacement.status = "finished"  # reported over, cleanup pending
+            self.assertFalse(replacement.reaped)
+            self.assertIsNone(replacement_proc.poll())
+
+            # The older run both requests will park on: terminal, unreaped.
+            old = appmod.Run("x = 1\n")
+            old.status = "finished"
+            appmod.CURRENT = old
+
+        real_wait = appmod._wait_reaped
+        wait_calls = []  # every run object a request parks on, in order
+        both_parked = threading.Event()
+
+        def spy_wait(run, timeout=appmod.REAP_WAIT_TIMEOUT):
+            wait_calls.append(run)
+            if len(wait_calls) == 2:
+                both_parked.set()
+            return real_wait(run, timeout=timeout)
+
+        results = []
+
+        def do_run(tag):
+            res = self.client.post("/api/run", json={"code": SIMPLE_CODE})
+            results.append((tag, res.status_code, res.get_json()))
+
+        with mock.patch.object(appmod, "_wait_reaped", spy_wait):
+            threads = [threading.Thread(target=do_run, args=(i,))
+                       for i in range(2)]
+            for t in threads:
+                t.start()
+            self.assertTrue(both_parked.wait(10),
+                            "both rerun requests should park on the old run")
+            self.assertEqual(len(self.created), 1,
+                             "only the replacement's child exists so far")
+
+            # The old child is reaped; meanwhile the replacement (terminal,
+            # unreaped) is the current run when the waiters wake up.
+            with appmod.COND:
+                old.reaped = True
+                appmod.CURRENT = replacement
+                appmod.COND.notify_all()
+
+            # The waiters must re-park on the unreaped replacement: no new
+            # run is registered, no child is spawned, no request returns.
+            self.assertTrue(
+                wait_for(lambda: len(wait_calls) >= 4, timeout=10),
+                f"waiters did not re-park on the unreaped replacement: "
+                f"parks={len(wait_calls)} procs={len(self.created)} "
+                f"results={results}")
+            self.assertTrue(all(run is replacement for run in wait_calls[2:]),
+                            "waiters parked on something other than the replacement")
+            self.assertEqual(len(self.created), 1,
+                             "a second child was spawned while the replacement "
+                             "was unreaped (two live children)")
+            self.assertIsNone(replacement_proc.poll(),
+                              "the replacement's child must still be alive")
+            self.assertEqual(len(results), 0,
+                             "a parked request returned while the replacement "
+                             "was unreaped")
+            with appmod.COND:
+                self.assertIs(appmod.CURRENT, replacement,
+                              "a waiting request replaced the current run, "
+                              "invalidating its run_id")
+
+            # The replacement's child exits and is reaped by its reader
+            # thread: the slot frees up. Exactly one waiter is admitted and
+            # spawns exactly one child; the other sees the now-active run
+            # and gets 409.
+            appmod._kill_proc(replacement_proc)
+            self.assertTrue(wait_for(lambda: replacement.reaped, timeout=10),
+                            "replacement child was never reaped")
+            for t in threads:
+                t.join(timeout=10)
+                self.assertFalse(t.is_alive(), "rerun request hung")
+
+        self.assertEqual(sorted(r[1] for r in results), [200, 409], results)
+        self.assertEqual(len(self.created), 2,
+                         "exactly one new child may be spawned after reaping")
+        self.assert_proc_dead(replacement_proc)
+        winner = next(r for r in results if r[1] == 200)
+        new_id = winner[2]["run_id"]
+        self.assertEqual(self.state()["run_id"], new_id)
+        self.wait_paused(new_id)
+        self.cleanup_run(new_id)
+
+    def test_waiter_conflicts_with_active_replacement(self):
+        """A request parked on an unreaped old run wakes up to find the
+        slot held by an ACTIVE replacement run: it must get 409 and must
+        not spawn a process or replace CURRENT."""
+        active = appmod.Run("y = 2\n")  # replacement holding the slot
+        old = appmod.Run("x = 1\n")
+        old.status = "finished"  # terminal, unreaped
+        with appmod.COND:
+            appmod.CURRENT = old
+
+        real_wait = appmod._wait_reaped
+        parked = threading.Event()
+
+        def spy_wait(run, timeout=appmod.REAP_WAIT_TIMEOUT):
+            parked.set()
+            return real_wait(run, timeout=timeout)
+
+        result = {}
+
+        def do_run():
+            res = self.client.post("/api/run", json={"code": SIMPLE_CODE})
+            result["status"] = res.status_code
+            result["body"] = res.get_json()
+
+        with mock.patch.object(appmod, "_wait_reaped", spy_wait):
+            t = threading.Thread(target=do_run)
+            t.start()
+            self.assertTrue(parked.wait(10),
+                            "request should park on the unreaped old run")
+            # The old child is reaped, but an active run now owns the slot.
+            with appmod.COND:
+                old.reaped = True
+                appmod.CURRENT = active
+                appmod.COND.notify_all()
+            t.join(timeout=10)
+            self.assertFalse(t.is_alive(), "rerun request hung")
+
+        self.assertEqual(result["status"], 409, result)
+        self.assertEqual(len(self.created), 0,
+                         "conflicting request spawned a process")
+        with appmod.COND:
+            self.assertIs(appmod.CURRENT, active,
+                          "rejected request replaced the current run")
+
+    def test_reap_wait_timeout_409_never_replaces_current(self):
+        """If the old run stays terminal-but-unreaped past the wait
+        timeout, /api/run returns 409 without spawning a process and
+        without replacing the current run."""
+        old = appmod.Run("x = 1\n")
+        old.status = "finished"  # terminal, never gets reaped
+        with appmod.COND:
+            appmod.CURRENT = old
+        with mock.patch.object(appmod, "REAP_WAIT_TIMEOUT", 0.3):
+            started = time.monotonic()
+            res = self.client.post("/api/run", json={"code": SIMPLE_CODE})
+            elapsed = time.monotonic() - started
+        self.assertEqual(res.status_code, 409, res.get_data(as_text=True))
+        self.assertGreaterEqual(elapsed, 0.25,
+                                "returned before waiting out the reap timeout")
+        self.assertEqual(len(self.created), 0,
+                         "timed-out request spawned a process")
+        with appmod.COND:
+            self.assertIs(appmod.CURRENT, old,
+                          "timed-out request replaced the current run")
 
 
 if __name__ == "__main__":
